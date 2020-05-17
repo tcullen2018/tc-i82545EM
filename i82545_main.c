@@ -82,6 +82,155 @@ err_tx_setup:
     EXIT;
 }
 
+/**
+ * i82545_close - Disables a network interface
+ * @netdev: network interface device structure
+ *
+ * Returns 0, this is not allowed to fail
+ *
+ * The close entry point is called when an interface is de-activated
+ * by the OS.  The hardware is still under the drivers control, but
+ * needs to be disabled.  A global MAC reset is issued to stop the
+ * hardware, and all transmit and receive resources are freed.
+ **/
+int i82545_close( struct net_device *netdev )
+{
+    struct i82545_adapter *adapter = netdev_priv( netdev );
+    struct i82545_hw *hw = &adapter->hw;
+    int count = I82545_CHECK_RESET_COUNT;
+    ENTER;
+
+    while( test_bit( __I82545_RESETTING,&adapter->flags ) && count-- )
+        usleep_range( 10000,20000 );
+
+    WARN_ON( test_bit( __I82545_RESETTING,&adapter->flags ) );
+    i82545_down( adapter );
+    i82545_power_down_phy( adapter );
+    i82545_free_irq( adapter );
+
+    i82545_free_all_tx_resources( adapter );
+    i82545_free_all_rx_resources( adapter );
+
+    /* kill manageability vlan ID if supported, but not if a vlan with
+     * the same ID is registered on the host OS (let 8021q kill it)
+     */
+    if( ( hw->mng_cookie.status & I82545_MNG_DHCP_COOKIE_STATUS_VLAN_SUPPORT ) &&
+        !test_bit( adapter->mng_vlan_id,adapter->active_vlans ) ) {
+        i82545_vlan_rx_kill_vid( netdev,htons( ETH_P_8021Q ),adapter->mng_vlan_id );
+    }
+
+    EXIT;
+}
+
+#define TXD_USE_COUNT(S, X) (((S) + ((1 << (X)) - 1)) >> (X))
+static netdev_tx_t i82545_xmit_frame( struct sk_buff *skb,struct net_device *netdev )
+{
+    struct i82545_adapter *adapter = netdev_priv(netdev);
+    struct i82545_hw *hw = &adapter->hw;
+    struct i82545_tx_ring *tx_ring;
+    unsigned int first, max_per_txd = I82545_MAX_DATA_PER_TXD;
+    unsigned int max_txd_pwr = I82545_MAX_TXD_PWR;
+    unsigned int tx_flags = 0;
+    unsigned int len = skb_headlen(skb);
+    unsigned int nr_frags;
+    unsigned int mss;
+    int count = 0;
+    int tso;
+    unsigned int f;
+    __be16 protocol = vlan_get_protocol(skb);
+    ENTER;
+
+    tx_ring = adapter->tx_ring;
+
+    /* On PCI/PCI-X HW, if packet size is less than ETH_ZLEN,
+    * packets may get corrupted during padding by HW.
+    * To work around this issue, pad all small packets manually.
+    */
+    if( eth_skb_pad( skb ) )
+        EXITRC( NETDEV_TX_OK );
+
+    mss = skb_shinfo( skb )->gso_size;
+    /* reserve a descriptor for the offload context */
+    if( mss || skb->ip_summed == CHECKSUM_PARTIAL )
+        count++;
+    count++;
+
+    /* Controller Erratum workaround */
+    if( !skb->data_len && tx_ring->last_tx_tso && !skb_is_gso( skb ) )
+        count++;
+
+    count += TXD_USE_COUNT( len,max_txd_pwr );
+
+    /* work-around for errata 10 and it applies to all controllers
+    * in PCI-X mode, so add one more descriptor to the count
+    */
+    if( unlikely( hw->bus_type == i82545_bus_type_pcix && len > 2015 ) )
+        count++;
+
+    nr_frags = skb_shinfo( skb )->nr_frags;
+    for( f=0; f < nr_frags; f++ )
+        count += TXD_USE_COUNT( skb_frag_size( &skb_shinfo( skb )->frags[f] ),max_txd_pwr );
+
+    /* need count + 2 desc gap to keep tail from touching
+    * head, otherwise try next time
+    */
+    if( unlikely( i82545_maybe_stop_tx( netdev,tx_ring,count + 2 ) ) )
+        EXITRC( NETDEV_TX_BUSY );
+
+    if( skb_vlan_tag_present( skb ) ) {
+        tx_flags |= I82545_TX_FLAGS_VLAN;
+        tx_flags |= (skb_vlan_tag_get( skb ) << I82545_TX_FLAGS_VLAN_SHIFT );
+    }
+
+    first = tx_ring->next_to_use;
+    tso   = i82545_tso( adapter,tx_ring,skb,protocol );
+    if( tso < 0 ) {
+        dev_kfree_skb_any( skb );
+        EXITRC( NETDEV_TX_OK );
+    }
+
+    if( likely( tso ) ) {
+        tx_ring->last_tx_tso = true;
+        tx_flags             = I82545_TX_FLAGS_TSO;
+    }
+    else if( likely( i82545_tx_csum( adapter,tx_ring,skb,protocol ) ) )
+        tx_flags |= I82545_TX_FLAGS_CSUM;
+
+    if( protocol == htons( ETH_P_IP ) )
+        tx_flags |= I82545_TX_FLAGS_IPV4;
+    if( unlikely( skb->no_fcs ) )
+        tx_flags |= I82545_TX_FLAGS_NO_FCS;
+
+    count = i82545_tx_map( adapter,tx_ring,skb,first,max_per_txd,nr_frags,mss );
+    if( count ) {
+        /* The descriptors needed is higher than other Intel drivers
+        * due to a number of workarounds.  The breakdown is below:
+        * Data descriptors: MAX_SKB_FRAGS + 1
+        * Context Descriptor: 1
+        * Keep head from touching tail: 2
+        * Workarounds: 3
+        */
+        int desc_needed = MAX_SKB_FRAGS + 7;
+
+        netdev_sent_queue( netdev,skb->len );
+        skb_tx_timestamp( skb );
+
+        i82545_tx_queue( adapter,tx_ring,tx_flags,count );
+        i82545_maybe_stop_tx( netdev,tx_ring,desc_needed );
+
+        if( !netdev_xmit_more() ||
+            netif_xmit_stopped( netdev_get_tx_queue( netdev,0 ) ) )
+            writel( tx_ring->next_to_use,hw->hw_addr + tx_ring->tdt );
+    }
+    else {
+        dev_kfree_skb_any( skb );
+        tx_ring->buffer_info[first].time_stamp = 0;
+        tx_ring->next_to_use = first;
+    }
+
+    EXITRC( NETDEX_TX_OK );
+}
+
 static const struct net_device_ops i82545_netdev_ops = {
     .ndo_open               = i82545_open,
     .ndo_stop               = i82545_close,

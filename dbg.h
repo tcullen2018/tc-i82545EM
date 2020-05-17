@@ -9,5 +9,7 @@
               return ret;
 #define EXITV pr_info( "Exiting %s\n",__FUNCTION__ ); \
               return;
-
+#define EXITRC( x ) ret = x; \
+                    pr_info( "Exiting %s line=%d, rc=%d\n",__FUNCTION__,__LINE__,ret ); \
+                    return ret;
 #endif
