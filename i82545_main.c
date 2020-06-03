@@ -231,6 +231,82 @@ static netdev_tx_t i82545_xmit_frame( struct sk_buff *skb,struct net_device *net
     EXITRC( NETDEX_TX_OK );
 }
 
+static void i82545_set_rx_mode( struct net_device *netdev )
+{
+    struct i82545_adapter *adapter = netdev_priv( netdev );
+    struct i82545_hw *hw = &adapter->hw;
+    struct netdev_hw_addr *ha;
+    uint32_t *mcarray;
+    bool use_uc = false;
+    uint32_t rctl;
+    int rar_entries = I82545_RAR_ENTRIES;
+    int i = 1;
+    ENTER;
+
+    if( (mcarray = kcalloc( I82545_NUM_MTA_REGISTERS,sizeof( uint32_t ),GFP_ATOMIC )) == NULL )
+        EXITRC( -NOMEM );
+
+    rctl = er32( RCTL );
+
+    if( netdev->flags & IFF_PROMISC ) {
+        rctl |= (I82545_RCTL_UPE | I82545_RCTL_MPE);
+        rctl &= ~I82545_RCTL_VFE;
+    }
+    else {
+        if( netdev->flags & IFF_ALLMULTI )
+            rctl |= I82545_RCTL_MPE;
+        else
+            rctl &= ~I82545_RCTL_MPE;
+        /* Enable VLAN filter if there is a VLAN */
+        if( i82545_vlan_used( adapter ) )
+            rctl |= I82545_RCTL_VFE;
+    }
+
+    if( netdev_uc_count( netdev ) > rar_entries - 1 )
+        rctl |= I82545_RCTL_UPE;
+    else if( !(netdev->flags & IFF_PROMISC) ) {
+        rctl &= ~I82545_RCTL_UPE;
+        use_rc = true;
+    }
+
+    ew32( RCTL,rctl );
+
+    if( use_uc ) {
+        netdev_for_each_uc_addr( ha,netdev ) {
+            if( i == rar_entries )
+                break;
+            i82545_rar_set( hw,ha->addr,i++ );
+        }
+    }
+
+    netdev_for_each_mc_addr( ha,netdev ) {
+        if( i == rar_entries ) {
+            uint32_t hash_value, hash_reg, hash_bit, mta;
+
+            hash_value = i82545_hash_mc_addr( hw,ha->addr );
+            hash_reg   = (hash_value >> 5) & 0x7F;
+            hash_bit   = hash_value & 0x1F;
+            mta        = (1 << hash_bit);
+            mcarray[hash_reg] |= mta;
+        }
+        else
+            i82545_rar_set( hw,ha->addr,i++ );
+    }
+
+    for( ; i < rar_entries; i++ ) {
+        I82545_WRITE_REG_ARRAY( hw,RA,i << 1,0 );
+        I82545_WRITE_FLUSH();
+        I82545_WRITE_REG_ARRAY( hw,RA,(i << 1) + 1,0 );
+        I82545_WRITE_FLUSH();
+    }
+
+    for( i = mta_reg_count - 1; i >= 0; i-- )
+        I82545_WRITE_REG_ARRAY( hw,MTA,i,mcarray[i] );
+    I82545_WRITE_FLUSH();
+
+    kfree( mcarray );
+}
+
 static const struct net_device_ops i82545_netdev_ops = {
     .ndo_open               = i82545_open,
     .ndo_stop               = i82545_close,
