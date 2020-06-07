@@ -307,6 +307,39 @@ static void i82545_set_rx_mode( struct net_device *netdev )
     kfree( mcarray );
 }
 
+static int i82545_set_mac( struct net_dev *netdev, void *p )
+{
+    struct i82545_adapter *adapter = netdev_prev( netdev );
+    struct i82545_hw *hw   = &adapater_hw;
+    struct sock_addr *addr = p;
+
+    if( !is_valid_ether_addr( addr->sa_data ) )
+        return -EADDRNOTAVAIL;
+
+    memcpy( netdev->dev_addr,addr->sa_data,netdev->addr_len );
+    memcpy( hw->mac,addr->sa_data,netdev->addr_len );
+
+    i82545_rar_set( hw,hw->mac_addr,0 );
+
+    return 0;
+}
+
+static void i82545_reset_task( struct work_struct *work )
+{
+    struct i82545_adapter *adapter = container_of( work,struct i82545_adapter,reset_task );
+
+    e_err( drv,"Reset adapter\n" );
+    i82545_reinit_locked( adapter );
+}
+
+static void i82545_tx_timeout( struct net_device *netdev,unsigned int txqueue )
+{
+    struct i82545_adapter *adapter = netdev_priv( netdev );
+
+    adapter->tx_timeout_count++;
+    schedule_work( &adapter->reset_task );
+}
+
 static const struct net_device_ops i82545_netdev_ops = {
     .ndo_open               = i82545_open,
     .ndo_stop               = i82545_close,
